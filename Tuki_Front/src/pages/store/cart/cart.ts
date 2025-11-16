@@ -1,9 +1,10 @@
-import { Get } from "../../../services/api.ts"
+import { Get, Post } from "../../../services/api.ts"
 import { readEnvOr } from "@utils/env"
 import { requireElementById } from "@utils/dom"
 import { formatCurrency } from "@utils/format"
 import { normalizeBoolean, normalizeNumber, normalizeString, unwrapCollection } from "@utils/normalize"
 import { logoutUser } from "@utils/localStorage"
+import type { IUsuarioLogin } from "@models/IUsuarios/IUsuarioLogin"
 
 interface CartItem {
   id: string
@@ -27,9 +28,65 @@ interface CartItemDetail {
   isAvailable: boolean
 }
 
+interface CheckoutOrderItemPayload {
+  productoId: number
+  cantidad: number
+}
+
+interface CheckoutOrderPayload {
+  usuarioId: number
+  items: CheckoutOrderItemPayload[]
+}
+
+const deriveCreateOrdersUrl = (template: string): string | null => {
+  if (!template) {
+    return null
+  }
+
+  let sanitized = template.trim()
+  if (!sanitized) {
+    return null
+  }
+
+  const [basePath] = sanitized.split("?")
+  sanitized = basePath
+
+  const patterns = [
+    /\/usuario\/\{[^/]*\}$/i,
+    /\/usuario\/:?[^/]*$/i,
+    /\/usuario$/i,
+    /\/user\/\{[^/]*\}$/i,
+    /\/user\/:?[^/]*$/i,
+    /\/user$/i,
+  ]
+
+  patterns.forEach((pattern) => {
+    sanitized = sanitized.replace(pattern, "")
+  })
+
+  const prefixMatch = sanitized.match(/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//)
+  let prefix = ""
+  let rest = sanitized
+  if (prefixMatch) {
+    prefix = prefixMatch[0]
+    rest = sanitized.slice(prefix.length)
+  }
+
+  rest = rest.replace(/\/{2,}/g, "/")
+  rest = rest.replace(/\/$/, "")
+
+  const result = `${prefix}${rest}`
+  return result || null
+}
+
 const PRODUCTS_API_URL = readEnvOr("VITE_API_URL_PRODUCTS", "")
 const CART_STORAGE_KEY = "storeCartItems"
 const SHIPPING_COST = 500
+const ORDERS_API_URL = readEnvOr("VITE_API_URL_CLIENT_ORDERS", "")
+const CREATE_ORDER_API_URL = readEnvOr(
+  "VITE_API_URL_CLIENT_ORDERS_CREATE",
+  deriveCreateOrdersUrl(ORDERS_API_URL) ?? "",
+)
 
 const fallbackImage = new URL("../home/assets/pngwing.png", import.meta.url).href
 
@@ -53,6 +110,7 @@ const checkoutForm = requireElementById<HTMLFormElement>("checkout-form")
 const checkoutFeedback = requireElementById<HTMLParagraphElement>("checkout-feedback")
 const checkoutPhone = requireElementById<HTMLInputElement>("checkout-phone")
 const checkoutCloseTriggers = checkoutModal.querySelectorAll<HTMLElement>("[data-close]")
+const checkoutSubmitButton = checkoutForm.querySelector<HTMLButtonElement>('button[type="submit"]')
 const cartBadge = requireElementById<HTMLSpanElement>("cart-badge")
 
 const logoutButton = document.getElementById("logout-button") as HTMLAnchorElement | null
@@ -64,6 +122,24 @@ let loadErrorMessage: string | null = null
 let confirmationMessage: string | null = null
 const quantityWarnings = new Map<string, string>()
 let lastFocusedElement: HTMLElement | null = null
+
+const getCurrentUser = (): IUsuarioLogin | null => {
+  const raw = localStorage.getItem("userData")
+  if (!raw) {
+    return null
+  }
+
+  try {
+    const parsed = JSON.parse(raw) as Partial<IUsuarioLogin>
+    if (parsed && typeof parsed.id === "number" && parsed.loggedIn) {
+      return parsed as IUsuarioLogin
+    }
+  } catch (error) {
+    console.error("No se pudo parsear la sesión del usuario", error)
+  }
+
+  return null
+}
 
 const formatProductsCount = (count: number): string => {
   if (count === 1) {
@@ -538,7 +614,7 @@ const loadProducts = async () => {
   renderCart()
 }
 
-const handleCheckoutSubmit = (event: SubmitEvent) => {
+const handleCheckoutSubmit = async (event: SubmitEvent) => {
   event.preventDefault()
 
   if (!checkoutForm.reportValidity()) {
@@ -556,11 +632,73 @@ const handleCheckoutSubmit = (event: SubmitEvent) => {
     return
   }
 
-  checkoutFeedback.textContent = "¡Pedido confirmado!"
-  confirmationMessage = "¡Gracias por tu compra! Nos pondremos en contacto para coordinar la entrega."
-  clearCart()
-  closeCheckoutModal()
-  checkoutForm.reset()
+  if (!CREATE_ORDER_API_URL) {
+    checkoutFeedback.textContent = "No se configuró la URL de pedidos."
+    return
+  }
+
+  const user = getCurrentUser()
+  if (!user) {
+    checkoutFeedback.textContent = "Necesitás iniciar sesión para finalizar tu pedido."
+    return
+  }
+
+  const details = buildCartDetails()
+  const items = details
+    .filter((detail) => detail.product && detail.isAvailable && detail.quantity > 0)
+    .map((detail) => {
+      const rawId = detail.product?.id ?? detail.id
+      const numericId = Number.parseInt(String(rawId), 10)
+      if (!Number.isFinite(numericId) || numericId <= 0) {
+        console.warn("No se pudo interpretar el ID del producto para el pedido", rawId)
+        return null
+      }
+      const item: CheckoutOrderItemPayload = {
+        productoId: numericId,
+        cantidad: detail.quantity,
+      }
+      return item
+    })
+    .filter((item): item is CheckoutOrderItemPayload => Boolean(item))
+
+  if (!items.length) {
+    checkoutFeedback.textContent = "No hay productos disponibles para procesar el pedido."
+    return
+  }
+
+  const payload: CheckoutOrderPayload = {
+    usuarioId: user.id,
+    items,
+  }
+
+  checkoutFeedback.textContent = "Confirmando pedido..."
+  if (checkoutSubmitButton) {
+    checkoutSubmitButton.disabled = true
+  }
+
+  try {
+    const { error } = await Post<CheckoutOrderPayload, unknown>(payload, CREATE_ORDER_API_URL)
+    if (error) {
+      throw error
+    }
+
+    checkoutFeedback.textContent = "¡Pedido confirmado!"
+    confirmationMessage = "¡Gracias por tu compra! Nos pondremos en contacto para coordinar la entrega."
+    clearCart()
+    closeCheckoutModal()
+    checkoutForm.reset()
+  } catch (error) {
+    console.error("No se pudo confirmar el pedido", error)
+    const message =
+      typeof error === "object" && error !== null && "mensaje" in error
+        ? String((error as { mensaje?: unknown }).mensaje || "No se pudo confirmar el pedido.")
+        : "No se pudo confirmar el pedido. Intentá nuevamente."
+    checkoutFeedback.textContent = message
+  } finally {
+    if (checkoutSubmitButton) {
+      checkoutSubmitButton.disabled = false
+    }
+  }
 }
 
 const initAuth = () => {
@@ -613,7 +751,9 @@ const init = async () => {
   cartRetryButton.addEventListener("click", () => {
     loadProducts()
   })
-  checkoutForm.addEventListener("submit", handleCheckoutSubmit)
+  checkoutForm.addEventListener("submit", (event) => {
+    void handleCheckoutSubmit(event)
+  })
 
   await loadProducts()
 }
